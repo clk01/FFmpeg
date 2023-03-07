@@ -1,0 +1,25 @@
+name: Build FFmpeg Library
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        compiler: [gcc, clang, msvc]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+    - name: Install dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y nasm build-essential pkg-config libmp3lame-dev libopus-dev libvpx-dev libx264-dev libx265-dev libass-dev libwebp-dev libssl-dev zlib1g-dev
+      if: matrix.os == 'ubuntu-latest'
+    - name: Build FFmpeg
+      run: |
+        ./configure --enable-shared --disable-static --enable-gpl --enable-version3 --enable-nonfree --enable-postproc --enable-libmp3lame --enable-libopus --enable-libvpx --enable-libx264 --enable-libx265 --enable-libass --enable-libwebp --enable-openssl --enable-zlib
+        make -j8
+      if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
