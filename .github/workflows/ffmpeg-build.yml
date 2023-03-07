@@ -1,0 +1,32 @@
+name: ffmpeg-build
+
+on:
+  push:
+    branches: master
+
+jobs:
+  build:
+    name: Build FFmpeg
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v2
+      with:
+        submodules: recursive
+    
+    - name: Install Dependencies
+      run: |
+        apt-get update && apt-get install -y \
+          yasm libx264-dev libfdk-aac-dev libmp3lame-dev libopus-dev libvpx-dev libass-dev
+    
+    - name: Configure FFmpeg
+      run: |
+        cd ffmpeg
+        ./configure --enable-gpl --enable-libfdk-aac --enable-libmp3lame \
+                    --enable-libopus --enable-libvpx --enable-libx264 --enable-libass
+    
+    - name: Build FFmpeg
+      run: |
+        cd ffmpeg
+        make
