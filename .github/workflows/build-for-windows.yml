@@ -1,193 +1,144 @@
-name: Build FFmpeg for Windows (x86 + x64, many codecs + libsoxr)
+name: Full FFmpeg Manual Build (MSYS2)
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
   workflow_dispatch:
+  push:
+    branches: [ master, main ]
 
 jobs:
   build:
+    name: Build ${{ matrix.msystem }}
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: win64
-            msystem: MINGW64
-            mingw_arch: x86_64
-            ff_arch: x86_64
-            prefix: /mingw64
-          - name: win32
-            msystem: MINGW32
-            mingw_arch: i686
-            ff_arch: x86
-            prefix: /mingw32
+          - msystem: MINGW64
+            arch: x86_64
+            prefix: mingw-w64-x86_64
+            name: win64
+          - msystem: MINGW32
+            arch: i686
+            prefix: mingw-w64-i686
+            name: win32
+
+    defaults:
+      run:
+        shell: msys2 {0}
 
     steps:
-      - name: Checkout FFmpeg source
+      - name: Checkout Your Fork
         uses: actions/checkout@v4
         with:
-          submodules: true
+          fetch-depth: 0 # 获取完整提交记录以便生成版本号
 
-      # 只初始化 MSYS2，避免一次性装太多容易失败
-      - name: Setup MSYS2 base
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
           update: true
-
-      # 手工 pacman 装依赖，带重试逻辑
-      - name: Install toolchain and codec libs (with retry)
-        shell: msys2 {0}
-        run: |
-          set -e
-
-          pacman -Sy --noconfirm
-
-          install_pkgs() {
-            pacman -S --noconfirm --needed \
-              base-devel \
-              git \
-              yasm \
-              nasm \
-              pkgconf \
-              mingw-w64-${{ matrix.mingw_arch }}-toolchain \
-              mingw-w64-${{ matrix.mingw_arch }}-x264 \
-              mingw-w64-${{ matrix.mingw_arch }}-x265 \
-              mingw-w64-${{ matrix.mingw_arch }}-libvpx \
-              mingw-w64-${{ matrix.mingw_arch }}-aom \
-              mingw-w64-${{ matrix.mingw_arch }}-opus \
-              mingw-w64-${{ matrix.mingw_arch }}-libvorbis \
-              mingw-w64-${{ matrix.mingw_arch }}-lame \
-              mingw-w64-${{ matrix.mingw_arch }}-libwebp \
-              mingw-w64-${{ matrix.mingw_arch }}-libtheora \
-              mingw-w64-${{ matrix.mingw_arch }}-openjpeg2 \
-              mingw-w64-${{ matrix.mingw_arch }}-speex \
-              mingw-w64-${{ matrix.mingw_arch }}-rtmpdump \
-              mingw-w64-${{ matrix.mingw_arch }}-srt \
-              mingw-w64-${{ matrix.mingw_arch }}-vid.stab \
-              mingw-w64-${{ matrix.mingw_arch }}-libsoxr \
-              mingw-w64-${{ matrix.mingw_arch }}-zimg \
-              mingw-w64-${{ matrix.mingw_arch }}-xvidcore \
-              mingw-w64-${{ matrix.mingw_arch }}-SDL2
-          }
-
-          n=0
-          until [ $n -ge 3 ]
-          do
-            install_pkgs && break
-            n=$((n+1))
-            echo "pacman failed, retry $n/3..."
-            sleep 30
-          done
-
-          if [ $n -ge 3 ]; then
-            echo "pacman failed after 3 retries, giving up."
-            exit 1
-          fi
-
-      # 只有 64 位额外装 fdk-aac + vmaf，同样带重试
-      - name: "Install extra codecs (64-bit only: fdk-aac, vmaf)"
-        if: matrix.name == 'win64'
-        shell: msys2 {0}
-        run: |
-          set -e
-
-          install_extra() {
-            pacman -S --noconfirm --needed \
-              mingw-w64-x86_64-fdk-aac \
-              mingw-w64-x86_64-vmaf
-          }
-
-          n=0
-          until [ $n -ge 3 ]
-          do
-            install_extra && break
-            n=$((n+1))
-            echo "pacman (extra) failed, retry $n/3..."
-            sleep 30
-          done
-
-          if [ $n -ge 3 ]; then
-            echo "pacman extra packages failed after 3 retries, giving up."
-            exit 1
-          fi
+          install: >-
+            base-devel
+            git
+            make
+            yasm
+            nasm
+            gcc
+            pkg-config
+            diffutils
+            ${{ matrix.prefix }}-toolchain
+            ${{ matrix.prefix }}-zlib
+            ${{ matrix.prefix }}-libx264
+            ${{ matrix.prefix }}-libx265
+            ${{ matrix.prefix }}-libvpx
+            ${{ matrix.prefix }}-libaom
+            ${{ matrix.prefix }}-dav1d
+            ${{ matrix.prefix }}-lame
+            ${{ matrix.prefix }}-fdk-aac
+            ${{ matrix.prefix }}-opus
+            ${{ matrix.prefix }}-libvorbis
+            ${{ matrix.prefix }}-libtheora
+            ${{ matrix.prefix }}-libass
+            ${{ matrix.prefix }}-libwebp
+            ${{ matrix.prefix }}-libxml2
+            ${{ matrix.prefix }}-freetype
+            ${{ matrix.prefix }}-fontconfig
+            ${{ matrix.prefix }}-fribidi
+            ${{ matrix.prefix }}-gmp
+            ${{ matrix.prefix }}-gnutls
+            ${{ matrix.prefix }}-srt
+            ${{ matrix.prefix }}-soxr
+            ${{ matrix.prefix }}-rav1e
+            ${{ matrix.prefix }}-libzimg
 
       - name: Configure FFmpeg
-        shell: msys2 {0}
         run: |
-          cd "$GITHUB_WORKSPACE"
+          # 创建构建目录
+          mkdir -p build_dir
+          cd build_dir
 
-          # 用对应前缀下的 toolchain + pkg-config
-          export PATH="${{ matrix.prefix }}/bin:$PATH"
-          export PKG_CONFIG_PATH="${{ matrix.prefix }}/lib/pkgconfig:$PKG_CONFIG_PATH"
+          # 这里的关键是 PKG_CONFIG_PATH，让 FFmpeg 找到刚才 pacman 安装的库
+          # MSYS2 会自动处理环境变量，所以我们直接运行 configure
 
-          # 选一个真正存在的 pkg-config
-          if command -v pkgconf >/dev/null 2>&1; then
-            export PKG_CONFIG=pkgconf
-          else
-            export PKG_CONFIG=pkg-config
-          fi
+          # 解释一下关键参数：
+          # --enable-static --disable-shared: 编译为静态 exe
+          # --pkg-config-flags="--static": 告诉 pkg-config 获取静态库的链接参数（非常重要！）
+          # --extra-ldflags="-static": 强制链接静态 C 运行库
 
-          EXTRA_FLAGS=""
-          # 64 位开启 libfdk-aac / libvmaf / nonfree
-          if [ "${{ matrix.name }}" = "win64" ]; then
-            EXTRA_FLAGS="$EXTRA_FLAGS --enable-libfdk-aac --enable-libvmaf --enable-nonfree"
-          fi
-
-          ./configure \
-            --prefix=${{ matrix.prefix }}/local-ffmpeg \
-            --arch=${{ matrix.ff_arch }} \
+          ../configure \
+            --prefix=../install_dir \
+            --arch=${{ matrix.arch }} \
             --target-os=mingw32 \
+            --pkg-config-flags="--static" \
             --enable-gpl \
             --enable-version3 \
+            --enable-nonfree \
             --enable-static \
             --disable-shared \
             --disable-debug \
+            --disable-doc \
             --enable-libx264 \
             --enable-libx265 \
             --enable-libvpx \
             --enable-libaom \
+            --enable-libdav1d \
             --enable-libmp3lame \
+            --enable-libfdk-aac \
             --enable-libopus \
             --enable-libvorbis \
-            --enable-libwebp \
             --enable-libtheora \
-            --enable-libopenjpeg \
-            --enable-libspeex \
-            --enable-librtmp \
+            --enable-libass \
+            --enable-libwebp \
+            --enable-libxml2 \
+            --enable-libfreetype \
+            --enable-libfontconfig \
+            --enable-libfribidi \
+            --enable-libgmp \
+            --enable-gnutls \
             --enable-libsrt \
-            --enable-libvidstab \
             --enable-libsoxr \
+            --enable-librav1e \
             --enable-libzimg \
-            --enable-libxvid \
-            --enable-sdl2 \
-            --extra-cflags="-O3" \
-            --extra-cxxflags="-O3" \
-            --extra-ldflags="-static" \
-            --pkg-config="$PKG_CONFIG" \
-            --pkg-config-flags="--static" \
-            $EXTRA_FLAGS
+            --extra-cflags="-static" \
+            --extra-ldflags="-static -static-libgcc -static-libstdc++"
 
-      - name: Build FFmpeg
-        shell: msys2 {0}
+      - name: Compile FFmpeg
         run: |
-          cd "$GITHUB_WORKSPACE"
+          cd build_dir
           make -j$(nproc)
           make install
 
-      - name: Collect build artifacts
-        shell: msys2 {0}
+      - name: Organize Artifacts
+        shell: pwsh
         run: |
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p dist/${{ matrix.name }}
-          cp -a ${{ matrix.prefix }}/local-ffmpeg/bin dist/${{ matrix.name }}/bin
-          cp -a ${{ matrix.prefix }}/local-ffmpeg/lib dist/${{ matrix.name }}/lib || true
-          cp -a ${{ matrix.prefix }}/local-ffmpeg/include dist/${{ matrix.name }}/include || true
+          # 这是一个 PowerShell 步骤，用于整理文件
+          # 将生成的 exe 移动到根目录方便打包
+          mkdir artifacts
+          Copy-Item install_dir/bin/ffmpeg.exe artifacts/ffmpeg-${{ matrix.name }}.exe
+          Copy-Item install_dir/bin/ffprobe.exe artifacts/ffprobe-${{ matrix.name }}.exe
 
-      - name: Upload FFmpeg artifacts
+      - name: Upload Build
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-${{ matrix.name }}
-          path: dist/${{ matrix.name }}
+          name: ffmpeg-${{ matrix.name }}-full
+          path: artifacts/*
