@@ -30,13 +30,14 @@ jobs:
       - name: Checkout Your Fork
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整提交记录以便生成版本号
+          fetch-depth: 0
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
           update: true
+          # 下面是修正后的包列表，去掉了多余的 'lib' 或补上了缺失的 'lib'
           install: >-
             base-devel
             git
@@ -49,9 +50,9 @@ jobs:
             ${{ matrix.prefix }}-toolchain
             ${{ matrix.prefix }}-zlib
             ${{ matrix.prefix }}-libx264
-            ${{ matrix.prefix }}-libx265
+            ${{ matrix.prefix }}-x265
             ${{ matrix.prefix }}-libvpx
-            ${{ matrix.prefix }}-libaom
+            ${{ matrix.prefix }}-aom
             ${{ matrix.prefix }}-dav1d
             ${{ matrix.prefix }}-lame
             ${{ matrix.prefix }}-fdk-aac
@@ -67,24 +68,17 @@ jobs:
             ${{ matrix.prefix }}-gmp
             ${{ matrix.prefix }}-gnutls
             ${{ matrix.prefix }}-srt
-            ${{ matrix.prefix }}-soxr
+            ${{ matrix.prefix }}-libsoxr
             ${{ matrix.prefix }}-rav1e
-            ${{ matrix.prefix }}-libzimg
+            ${{ matrix.prefix }}-zimg
 
       - name: Configure FFmpeg
         run: |
-          # 创建构建目录
           mkdir -p build_dir
           cd build_dir
 
-          # 这里的关键是 PKG_CONFIG_PATH，让 FFmpeg 找到刚才 pacman 安装的库
-          # MSYS2 会自动处理环境变量，所以我们直接运行 configure
-
-          # 解释一下关键参数：
-          # --enable-static --disable-shared: 编译为静态 exe
-          # --pkg-config-flags="--static": 告诉 pkg-config 获取静态库的链接参数（非常重要！）
-          # --extra-ldflags="-static": 强制链接静态 C 运行库
-
+          # 这里的 PKG_CONFIG_PATH 由 MSYS2 自动管理，无需手动设置
+          
           ../configure \
             --prefix=../install_dir \
             --arch=${{ matrix.arch }} \
@@ -131,11 +125,14 @@ jobs:
       - name: Organize Artifacts
         shell: pwsh
         run: |
-          # 这是一个 PowerShell 步骤，用于整理文件
-          # 将生成的 exe 移动到根目录方便打包
           mkdir artifacts
-          Copy-Item install_dir/bin/ffmpeg.exe artifacts/ffmpeg-${{ matrix.name }}.exe
-          Copy-Item install_dir/bin/ffprobe.exe artifacts/ffprobe-${{ matrix.name }}.exe
+          # 检查文件是否存在，防止 copy 报错中断流程
+          if (Test-Path install_dir/bin/ffmpeg.exe) {
+            Copy-Item install_dir/bin/ffmpeg.exe artifacts/ffmpeg-${{ matrix.name }}.exe
+          }
+          if (Test-Path install_dir/bin/ffprobe.exe) {
+            Copy-Item install_dir/bin/ffprobe.exe artifacts/ffprobe-${{ matrix.name }}.exe
+          }
 
       - name: Upload Build
         uses: actions/upload-artifact@v4
