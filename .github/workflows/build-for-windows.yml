@@ -30,53 +30,96 @@ jobs:
         with:
           submodules: true
 
-      # 通用依赖（32/64 都有的包）
-      - name: Setup MSYS2 (toolchain + common codec libs)
+      # 只初始化 MSYS2，不在这里装一大堆包，避免大事务失败
+      - name: Setup MSYS2 base
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
           update: true
-          install: >-
-            base-devel
-            git
-            yasm
-            nasm
-            pkgconf
-            mingw-w64-${{ matrix.mingw_arch }}-toolchain
-            mingw-w64-${{ matrix.mingw_arch }}-x264
-            mingw-w64-${{ matrix.mingw_arch }}-x265
-            mingw-w64-${{ matrix.mingw_arch }}-libvpx
-            mingw-w64-${{ matrix.mingw_arch }}-aom
-            mingw-w64-${{ matrix.mingw_arch }}-opus
-            mingw-w64-${{ matrix.mingw_arch }}-libvorbis
-            mingw-w64-${{ matrix.mingw_arch }}-lame
-            mingw-w64-${{ matrix.mingw_arch }}-libwebp
-            mingw-w64-${{ matrix.mingw_arch }}-libtheora
-            mingw-w64-${{ matrix.mingw_arch }}-openjpeg2
-            mingw-w64-${{ matrix.mingw_arch }}-speex
-            mingw-w64-${{ matrix.mingw_arch }}-rtmpdump
-            mingw-w64-${{ matrix.mingw_arch }}-srt
-            mingw-w64-${{ matrix.mingw_arch }}-vid.stab
-            mingw-w64-${{ matrix.mingw_arch }}-libsoxr
-            mingw-w64-${{ matrix.mingw_arch }}-zimg
-            mingw-w64-${{ matrix.mingw_arch }}-xvidcore
-            mingw-w64-${{ matrix.mingw_arch }}-SDL2
 
-      # 只有 64 位才装 fdk-aac 和 vmaf
+      # 手工用 pacman 安装依赖，带重试
+      - name: Install toolchain and codec libs (with retry)
+        shell: msys2 {0}
+        run: |
+          set -e
+
+          pacman -Sy --noconfirm
+
+          install_pkgs() {
+            pacman -S --noconfirm --needed \
+              base-devel \
+              git \
+              yasm \
+              nasm \
+              pkgconf \
+              mingw-w64-${{ matrix.mingw_arch }}-toolchain \
+              mingw-w64-${{ matrix.mingw_arch }}-x264 \
+              mingw-w64-${{ matrix.mingw_arch }}-x265 \
+              mingw-w64-${{ matrix.mingw_arch }}-libvpx \
+              mingw-w64-${{ matrix.mingw_arch }}-aom \
+              mingw-w64-${{ matrix.mingw_arch }}-opus \
+              mingw-w64-${{ matrix.mingw_arch }}-libvorbis \
+              mingw-w64-${{ matrix.mingw_arch }}-lame \
+              mingw-w64-${{ matrix.mingw_arch }}-libwebp \
+              mingw-w64-${{ matrix.mingw_arch }}-libtheora \
+              mingw-w64-${{ matrix.mingw_arch }}-openjpeg2 \
+              mingw-w64-${{ matrix.mingw_arch }}-speex \
+              mingw-w64-${{ matrix.mingw_arch }}-rtmpdump \
+              mingw-w64-${{ matrix.mingw_arch }}-srt \
+              mingw-w64-${{ matrix.mingw_arch }}-vid.stab \
+              mingw-w64-${{ matrix.mingw_arch }}-libsoxr \
+              mingw-w64-${{ matrix.mingw_arch }}-zimg \
+              mingw-w64-${{ matrix.mingw_arch }}-xvidcore \
+              mingw-w64-${{ matrix.mingw_arch }}-SDL2
+          }
+
+          # 重试 3 次
+          n=0
+          until [ $n -ge 3 ]
+          do
+            install_pkgs && break
+            n=$((n+1))
+            echo "pacman failed, retry $n/3..."
+            sleep 30
+          done
+
+          if [ $n -ge 3 ]; then
+            echo "pacman failed after 3 retries, giving up."
+            exit 1
+          fi
+
+      # 只有 64 位才装 fdk-aac 和 vmaf，同样带重试
       - name: "Install extra codecs (64-bit only: fdk-aac, vmaf)"
         if: matrix.name == 'win64'
         shell: msys2 {0}
         run: |
-          pacman -S --noconfirm --needed \
-            mingw-w64-x86_64-fdk-aac \
-            mingw-w64-x86_64-vmaf
+          set -e
+
+          install_extra() {
+            pacman -S --noconfirm --needed \
+              mingw-w64-x86_64-fdk-aac \
+              mingw-w64-x86_64-vmaf
+          }
+
+          n=0
+          until [ $n -ge 3 ]
+          do
+            install_extra && break
+            n=$((n+1))
+            echo "pacman (extra) failed, retry $n/3..."
+            sleep 30
+          done
+
+          if [ $n -ge 3 ]; then
+            echo "pacman extra packages failed after 3 retries, giving up."
+            exit 1
+          fi
 
       - name: Configure FFmpeg
         shell: msys2 {0}
         run: |
           cd "$GITHUB_WORKSPACE"
 
-          # 用对应前缀下的 toolchain + pkg-config
           export PATH="${{ matrix.prefix }}/bin:$PATH"
           export PKG_CONFIG_PATH="${{ matrix.prefix }}/lib/pkgconfig:$PKG_CONFIG_PATH"
 
