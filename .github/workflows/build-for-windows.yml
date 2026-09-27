@@ -54,7 +54,7 @@ jobs:
           # Package names follow MSYS2; packages missing from one architecture
           # are recorded in the artifact instead of pretending to be enabled.
           packages=(
-            aom dav1d x264 x265 libvpx libwebp libjxl openjpeg2
+            aom dav1d libx264 x265 libvpx libwebp libjxl openjpeg2
             opus lame fdk-aac libvorbis libtheora speex gsm opencore-amr
             libass freetype fontconfig fribidi harfbuzz
             libbluray libgme libmodplug libsoxr zimg vid.stab
@@ -88,14 +88,16 @@ jobs:
           pacman --noconfirm --needed -S "${available[@]}"
           if [[ "$BUILD_ARCH" == x64 ]]; then
             # The primary build must never silently lose its main codecs.
-            required=(x264 x265 libvpx aom dav1d opus lame fdk-aac)
-            for name in "${required[@]}"; do
-              pacman -Q "${MINGW_PACKAGE_PREFIX}-${name}" >/dev/null || {
-                echo "x64 required package unavailable: $name" >&2
-                exit 1
-              }
-            done
+            required=(libx264 x265 libvpx aom dav1d opus lame fdk-aac)
+          else
+            required=(libx264 x265 opus)
           fi
+          for name in "${required[@]}"; do
+            pacman -Q "${MINGW_PACKAGE_PREFIX}-${name}" >/dev/null || {
+              echo "${BUILD_ARCH} required package unavailable: $name" >&2
+              exit 1
+            }
+          done
 
       - name: Configure and compile this checkout
         env:
@@ -120,7 +122,7 @@ jobs:
           # All built-in decoders, encoders, muxers and filters stay enabled.
           # Optional libraries are enabled only when their MSYS2 package exists.
           optional=(
-            'aom:libaom' 'dav1d:libdav1d' 'x264:libx264'
+            'aom:libaom' 'dav1d:libdav1d' 'libx264:libx264'
             'x265:libx265' 'libvpx:libvpx' 'libwebp:libwebp'
             'libjxl:libjxl' 'openjpeg2:libopenjpeg'
             'opus:libopus' 'lame:libmp3lame'
@@ -168,6 +170,12 @@ jobs:
             if pacman -Q "${MINGW_PACKAGE_PREFIX}-${package}" >/dev/null 2>&1; then
               IFS=, read -ra options <<< "$option_list"
               for option in "${options[@]}"; do
+                if [[ "$option" == libsvtjpegxs ]] \
+                   && ! pkg-config --exists 'SvtJpegxs >= 0.10.0'; then
+                  installed=$(pkg-config --modversion SvtJpegxs 2>/dev/null || echo unknown)
+                  echo "Incompatible package: SvtJpegxs ${installed}; FFmpeg needs >= 0.10.0" >> ../dist/unavailable-options.txt
+                  continue
+                fi
                 if grep -Fq -- "--enable-${option} " <<< "$configure_help"; then
                   flags+=("--enable-${option}")
                 else
@@ -251,6 +259,6 @@ jobs:
           name: build-log-${{ matrix.arch }}-${{ github.run_number }}
           path: |
             build/ffbuild/config.log
-            dist/configure-options.txt
+            dist/*.txt
             missing-packages.txt
           if-no-files-found: ignore
