@@ -16,7 +16,8 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # Start both builds together; each target installs its own binaries.
+      max-parallel: 2
       matrix:
         include:
           - arch: x64
@@ -25,16 +26,13 @@ jobs:
           - arch: x86
             runner: windows-2022
             msystem: MINGW32
-          - arch: arm64
-            runner: windows-11-arm
-            msystem: CLANGARM64
 
     defaults:
       run:
         shell: msys2 {0}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -46,7 +44,7 @@ jobs:
             make
             diffutils
             pkgconf
-            mingw-w64-${{ matrix.msystem == 'MINGW32' && 'i686' || matrix.msystem == 'UCRT64' && 'ucrt-x86_64' || 'clang-aarch64' }}-cc
+            mingw-w64-${{ matrix.msystem == 'MINGW32' && 'i686' || 'ucrt-x86_64' }}-cc
 
       - name: Install available codec dependencies
         env:
@@ -64,28 +62,30 @@ jobs:
             xvidcore liblc3 rav1e svt-av1 libplacebo librsvg
             libvpl vulkan vulkan-headers libzvbi
           )
-          if [[ "$BUILD_ARCH" != arm64 ]]; then
-            packages+=(nasm ffnvcodec-headers amf-headers)
-            packages+=(
-              aribb24 libaribcaption libbs2b libcaca libcdio
-              dvdnav dvdread libmysofa qrencode quirc snappy
-              zeromq shine twolame rubberband librist codec2
-              openh264 vmaf vvenc kvazaar xavs2 libdavs2 oapv
-            )
-          fi
+          packages+=(nasm ffnvcodec-headers amf-headers)
+          packages+=(
+            aribb24 libaribcaption libbs2b libcaca libcdio
+            dvdnav dvdread libmysofa qrencode quirc snappy
+            zeromq shine twolame rubberband librist codec2
+            openh264 vmaf vvenc kvazaar xavs2 libdavs2 oapv
+          )
           if [[ "$BUILD_ARCH" == x64 ]]; then
             # Larger Windows-only toolkit and extra experimental codecs.
-            packages+=(svt-jpeg-xs frei0r-plugins vulkan-headers)
+            packages+=(svt-jpeg-xs frei0r-plugins)
           fi
           : > missing-packages.txt
+          available=()
           for name in "${packages[@]}"; do
             package="${MINGW_PACKAGE_PREFIX}-${name}"
             if pacman -Si "$package" >/dev/null 2>&1; then
-              pacman --noconfirm --needed -S "$package"
+              available+=("$package")
             else
               echo "$package" >> missing-packages.txt
             fi
           done
+          # Resolve and download the architecture's entire available set in
+          # one pacman transaction before starting the compiler.
+          pacman --noconfirm --needed -S "${available[@]}"
           if [[ "$BUILD_ARCH" == x64 ]]; then
             # The primary build must never silently lose its main codecs.
             required=(x264 x265 libvpx aom dav1d opus lame fdk-aac)
@@ -140,9 +140,8 @@ jobs:
             'librsvg:librsvg' 'libvpl:libvpl'
             'libzvbi:libzvbi'
           )
-          if [[ "$BUILD_ARCH" != arm64 ]]; then
-            optional+=(
-              'aribb24:libaribb24' 'libaribcaption:libaribcaption'
+          optional+=(
+            'aribb24:libaribb24' 'libaribcaption:libaribcaption'
             'libbs2b:libbs2b' 'libcaca:libcaca'
             'libcdio:libcdio' 'dvdnav:libdvdnav'
             'dvdread:libdvdread' 'libmysofa:libmysofa'
@@ -154,8 +153,7 @@ jobs:
             'vmaf:libvmaf' 'vvenc:libvvenc'
             'kvazaar:libkvazaar' 'xavs2:libxavs2'
             'libdavs2:libdavs2' 'oapv:liboapv'
-            )
-          fi
+          )
           if [[ "$BUILD_ARCH" == x64 ]]; then
             optional+=(
               'svt-jpeg-xs:libsvtjpegxs'
@@ -180,24 +178,20 @@ jobs:
               echo "Missing package: ${MINGW_PACKAGE_PREFIX}-${package} (${option_list})" >> ../dist/unavailable-options.txt
             fi
           done
-          if [[ "$BUILD_ARCH" != arm64 ]]; then
-            for feature in 'ffnvcodec-headers:nvenc' 'amf-headers:amf'; do
-              header_package=${feature%%:*}
-              option=${feature#*:}
-              if pacman -Q "${MINGW_PACKAGE_PREFIX}-${header_package}" >/dev/null 2>&1 \
-                 && grep -Fq -- "--enable-${option} " <<< "$configure_help"; then
-                flags+=("--enable-${option}")
-              fi
-            done
-          fi
+          for feature in 'ffnvcodec-headers:nvenc' 'amf-headers:amf'; do
+            header_package=${feature%%:*}
+            option=${feature#*:}
+            if pacman -Q "${MINGW_PACKAGE_PREFIX}-${header_package}" >/dev/null 2>&1 \
+               && grep -Fq -- "--enable-${option} " <<< "$configure_help"; then
+              flags+=("--enable-${option}")
+            fi
+          done
           if pacman -Q "${MINGW_PACKAGE_PREFIX}-SDL2" >/dev/null 2>&1; then
             : # FFplay is enabled by default when SDL2 is present.
           else
             flags+=(--disable-ffplay)
           fi
-          if [[ "$BUILD_ARCH" == arm64 ]]; then
-            flags+=(--arch=arm64)
-          elif [[ "$BUILD_ARCH" == x86 ]]; then
+          if [[ "$BUILD_ARCH" == x86 ]]; then
             flags+=(--arch=x86)
           else
             flags+=(--arch=x86_64)
@@ -234,8 +228,6 @@ jobs:
             required_encoders=(libx264 libx265 libvpx_vp9 libaom-av1 libopus libfdk_aac)
           elif [[ "$BUILD_ARCH" == x86 ]]; then
             required_encoders=(libx264 libx265 libopus)
-          else
-            required_encoders=()
           fi
           for encoder in "${required_encoders[@]}"; do
             if ! awk -v name="$encoder" '$2 == name { found=1 } END { exit !found }' dist/encoders.txt; then
@@ -243,11 +235,9 @@ jobs:
               exit 1
             fi
           done
-          if [[ "$BUILD_ARCH" != arm64 ]]; then
-            dist/ffprobe.exe -version > /dev/null
-          fi
+          dist/ffprobe.exe -version > /dev/null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ffmpeg-windows-${{ matrix.arch }}-${{ github.run_number }}
           path: dist/
@@ -256,7 +246,7 @@ jobs:
 
       - name: Upload configuration log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-log-${{ matrix.arch }}-${{ github.run_number }}
           path: |
