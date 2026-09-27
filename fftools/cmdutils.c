@@ -30,7 +30,6 @@
    references to libraries that are not being built. */
 
 #include "config.h"
-#include "compat/va_copy.h"
 #include "libavformat/avformat.h"
 #include "libswscale/swscale.h"
 #include "libswresample/swresample.h"
@@ -39,7 +38,6 @@
 #include "libavutil/bprint.h"
 #include "libavutil/display.h"
 #include "libavutil/getenv_utf8.h"
-#include "libavutil/libm.h"
 #include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/eval.h"
@@ -1267,7 +1265,7 @@ unsigned stream_specifier_match(const StreamSpecifier *ss,
                 break;
             }
         }
-        // fall-through
+        av_fallthrough;
     case STREAM_LIST_GROUP_IDX:
         if (ss->stream_list == STREAM_LIST_GROUP_IDX &&
             ss->list_id >= 0 && ss->list_id < s->nb_stream_groups)
@@ -1398,7 +1396,7 @@ unsigned stream_group_specifier_match(const StreamSpecifier *ss,
             case AV_STREAM_GROUP_PARAMS_TILE_GRID: {
                 const AVStreamGroupTileGrid *tg = candidate->params.tile_grid;
                 if (!tg->coded_width || !tg->coded_height || !tg->nb_tiles ||
-                    !tg->width       || !tg->height       || !tg->nb_tiles)
+                    !tg->width       || !tg->height       || !tg->offsets)
                     continue;
                 break;
             }

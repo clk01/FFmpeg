@@ -200,8 +200,8 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                                 const AVFrame *frame, int *got_packet_ptr)
 {
     LAMEContext *s = avctx->priv_data;
-    MPADecodeHeader hdr;
-    int len, ret, ch, discard_padding;
+    MPADecodeHeader2 hdr;
+    int len, ret, ch;
     int lame_result;
     uint32_t h;
 
@@ -263,7 +263,7 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         return 0;
     h = AV_RB32(s->buffer);
 
-    ret = avpriv_mpegaudio_decode_header(&hdr, h);
+    ret = ff_mpegaudio_decode_header(&hdr, h);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Invalid mp3 header at start of buffer\n");
         return AVERROR_BUG;
@@ -282,27 +282,9 @@ static int mp3lame_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         memmove(s->buffer, s->buffer + len, s->buffer_index);
 
         /* Get the next frame pts/duration */
-        ff_af_queue_remove(&s->afq, avctx->frame_size, &avpkt->pts,
-                           &avpkt->duration);
-
-        discard_padding = avctx->frame_size - ff_samples_from_time_base(avctx, avpkt->duration);
-        // Check if subtraction resulted in an overflow
-        if ((discard_padding < avctx->frame_size) != (avpkt->duration > 0)) {
-            av_log(avctx, AV_LOG_ERROR, "discard padding overflow\n");
-            return AVERROR(EINVAL);
-        }
-        if ((!s->delay_sent && avctx->initial_padding > 0) || discard_padding > 0) {
-            uint8_t* side_data = av_packet_new_side_data(avpkt,
-                                                         AV_PKT_DATA_SKIP_SAMPLES,
-                                                         10);
-            if (!side_data)
-                return AVERROR(ENOMEM);
-            if (!s->delay_sent) {
-                AV_WL32(side_data, avctx->initial_padding);
-                s->delay_sent = 1;
-            }
-            AV_WL32(side_data + 4, discard_padding);
-        }
+        ret = ff_af_queue_remove(&s->afq, avctx->frame_size, avpkt);
+        if (ret < 0)
+            return ret;
 
         *got_packet_ptr = 1;
     }

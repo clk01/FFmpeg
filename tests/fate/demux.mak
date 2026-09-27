@@ -175,8 +175,33 @@ fate-ts-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/ac3/mp3ac325-4864-small.ts
 FATE_FFPROBE_DEMUX-$(CONFIG_MPEGTS_DEMUXER) += fate-ts-timed-id3-demux
 fate-ts-timed-id3-demux: CMD = ffprobe_demux $(TARGET_SAMPLES)/mpegts/id3.ts
 
+tests/data/id3.ts: TAG = GEN
+tests/data/id3.ts: $(SAMPLES)/mpegts/id3.ts | tests/data
+	$(Q)cp $< $@
+
+tests/data/id3.m3u8: tests/data/id3.ts | tests/data
+	$(Q)printf '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nid3.ts\n#EXT-X-ENDLIST\n' > $@
+
+FATE_FFPROBE_DEMUX-$(call DEMDEC, MPEGTS HLS) += fate-ts-timed-id3-hls-demux
+fate-ts-timed-id3-hls-demux: tests/data/id3.m3u8
+fate-ts-timed-id3-hls-demux: CMD = ffprobe_demux $(TARGET_PATH)/tests/data/id3.m3u8
+
 FATE_SAMPLES_DEMUX-$(call PARSERDEM, JPEGXS, IMAGE_JPEGXS_PIPE, CONCAT_PROTOCOL) += fate-jxs-concat-demux
 fate-jxs-concat-demux: CMD = framecrc "-i concat:$(TARGET_SAMPLES)/jxs/lena.jxs|$(TARGET_SAMPLES)/jxs/lena.jxs -c:v copy"
+
+# 21-byte crafted VPK: header parses (nb_channels=80) but adpcm_psx open
+# fails. After find_stream_info the layout must stay 80, not 0.
+# ffprobe cannot be used: it aborts on the failed decoder open before
+# printing -show_entries.
+tests/data/vpk-div0.vpk: TAG = GEN
+tests/data/vpk-div0.vpk: | tests/data
+	$(Q)printf '\040\113\120\126\126\120\000\370\004\000\073\003\141\071\126\062\066\066\060\070\120' > $@
+
+FATE_FFMPEG-$(call ALLYES, VPK_DEMUXER ADPCM_PSX_DECODER FILE_PROTOCOL NULL_MUXER) += fate-demux-vpk-div0
+fate-demux-vpk-div0: tests/data/vpk-div0.vpk
+fate-demux-vpk-div0: CMD = ffmpeg -i $(TARGET_PATH)/tests/data/vpk-div0.vpk -map 0 -c copy -f null -
+fate-demux-vpk-div0: CMP = grep
+fate-demux-vpk-div0: REF = 80 channels
 
 FATE_SAMPLES_DEMUX += $(FATE_SAMPLES_DEMUX-yes)
 FATE_SAMPLES_FFMPEG += $(FATE_SAMPLES_DEMUX)

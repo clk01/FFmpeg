@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
@@ -724,8 +725,8 @@ AVFilterFormats *ff_all_color_ranges(void)
 AVFilterFormats *ff_all_alpha_modes(void)
 {
     AVFilterFormats *ret = NULL;
-    for (int range = 0; range < AVALPHA_MODE_NB; range++) {
-        if (ff_add_format(&ret, range) < 0)
+    for (int am = 0; am < AVALPHA_MODE_NB; am++) {
+        if (ff_add_format(&ret, am) < 0)
             return NULL;
     }
 
@@ -1193,7 +1194,7 @@ int ff_default_query_formats(AVFilterContext *ctx)
         break;
     default:
         av_assert2(!"Unreachable");
-    /* Intended fallthrough */
+        av_fallthrough;
     case FF_FILTER_FORMATS_PASSTHROUGH:
     case FF_FILTER_FORMATS_QUERY_FUNC:
     case FF_FILTER_FORMATS_QUERY_FUNC2:

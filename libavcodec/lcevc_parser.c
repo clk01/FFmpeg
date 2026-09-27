@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/mem.h"
 
 #include "avcodec.h"
@@ -72,17 +73,6 @@ static int lcevc_find_frame_end(AVCodecParserContext *s, const uint8_t *buf,
     return END_NOT_FOUND;
 }
 
-static const enum AVPixelFormat pix_fmts[4][4] = {
-    { AV_PIX_FMT_GRAY8,     AV_PIX_FMT_YUV420P,
-      AV_PIX_FMT_YUV422P,   AV_PIX_FMT_YUV444P, },
-    { AV_PIX_FMT_GRAY10,    AV_PIX_FMT_YUV420P10,
-      AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10, },
-    { AV_PIX_FMT_GRAY12,    AV_PIX_FMT_YUV420P12,
-      AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV444P12, },
-    { AV_PIX_FMT_GRAY14,    AV_PIX_FMT_YUV420P14,
-      AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV444P14, },
-};
-
 static int parse_nal_unit(AVCodecParserContext *s, AVCodecContext *avctx,
                           const H2645NAL *nal)
 {
@@ -131,7 +121,7 @@ static int parse_nal_unit(AVCodecParserContext *s, AVCodecContext *avctx,
             skip_bits(&gb, 2);
             bit_depth = get_bits(&gb, 2); // enhancement_depth_type
 
-            s->format = pix_fmts[bit_depth][chroma_format_idc];
+            s->format = ff_lcevc_depth_type[bit_depth][chroma_format_idc];
 
             if (resolution_type < 63) {
                 s->width  = ff_lcevc_resolution_type[resolution_type].width;
@@ -199,7 +189,7 @@ static int parse_nal_units(AVCodecParserContext *s, const uint8_t *buf,
         switch (nal->type) {
         case LCEVC_IDR_NUT:
             s->key_frame = 1;
-        // fall-through
+            av_fallthrough;
         case LCEVC_NON_IDR_NUT:
             parse_nal_unit(s, avctx, nal);
             break;
