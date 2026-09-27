@@ -44,6 +44,7 @@ jobs:
             make
             diffutils
             pkgconf
+            git
             mingw-w64-${{ matrix.msystem == 'MINGW32' && 'i686' || 'ucrt-x86_64' }}-cc
 
       - name: Install available codec dependencies
@@ -64,7 +65,7 @@ jobs:
           )
           packages+=(nasm ffnvcodec-headers amf-headers)
           packages+=(
-            aribb24 libaribcaption libbs2b libcaca libcdio
+            aribb24 libaribcaption libbs2b libcaca libcdio libcdio-paranoia
             dvdnav dvdread libmysofa qrencode quirc snappy
             zeromq shine twolame rubberband librist codec2
             openh264 vmaf vvenc kvazaar xavs2 libdavs2 oapv
@@ -90,7 +91,9 @@ jobs:
             # The primary build must never silently lose its main codecs.
             required=(libx264 x265 libvpx aom dav1d opus lame fdk-aac)
           else
-            required=(libx264 x265 opus)
+            # x86 libx264 may be absent from the live MINGW32 repository.
+            # The next step builds it from source when necessary.
+            required=(x265 opus)
           fi
           for name in "${required[@]}"; do
             pacman -Q "${MINGW_PACKAGE_PREFIX}-${name}" >/dev/null || {
@@ -98,6 +101,29 @@ jobs:
               exit 1
             }
           done
+
+      - name: Ensure x86 x264 development library
+        if: matrix.arch == 'x86'
+        run: |
+          set -euo pipefail
+          if pkg-config --exists x264; then
+            echo "Using MSYS2 libx264 $(pkg-config --modversion x264)"
+            exit 0
+          fi
+          # x264 (the CLI) is a different package from libx264 (the SDK).
+          # Build the SDK if the 32-bit package is no longer in pacman.
+          if ! git clone --depth 1 https://code.videolan.org/videolan/x264.git x264-source; then
+            rm -rf x264-source
+            git clone --depth 1 https://github.com/mirror/x264.git x264-source
+          fi
+          cd x264-source
+          ./configure --host=i686-w64-mingw32 --prefix="$MINGW_PREFIX" \
+            --enable-static --disable-cli --disable-opencl
+          make -j2
+          make install
+          pkg-config --exists x264
+          sed -i "/^${MINGW_PACKAGE_PREFIX}-libx264$/d" ../missing-packages.txt
+          echo "Built x86 libx264 from source: $(git rev-parse HEAD)" > ../x264-source.txt
 
       - name: Configure and compile this checkout
         env:
@@ -116,11 +142,12 @@ jobs:
             --disable-doc
             --enable-static
             --disable-shared
+            --pkg-config-flags=--static
             --enable-ffmpeg
             --enable-ffprobe
           )
           # All built-in decoders, encoders, muxers and filters stay enabled.
-          # Optional libraries are enabled only when their MSYS2 package exists.
+          # Optional libraries use MSYS2 packages; x86 libx264 may be built above.
           optional=(
             'aom:libaom' 'dav1d:libdav1d' 'libx264:libx264'
             'x265:libx265' 'libvpx:libvpx' 'libwebp:libwebp'
@@ -167,9 +194,15 @@ jobs:
           for item in "${optional[@]}"; do
             package=${item%%:*}
             option_list=${item#*:}
-            if pacman -Q "${MINGW_PACKAGE_PREFIX}-${package}" >/dev/null 2>&1; then
+            if pacman -Q "${MINGW_PACKAGE_PREFIX}-${package}" >/dev/null 2>&1 \
+               || { [[ "$package" == libx264 ]] && pkg-config --exists x264; }; then
               IFS=, read -ra options <<< "$option_list"
               for option in "${options[@]}"; do
+                if [[ "$option" == libcdio ]] \
+                   && ! pkg-config --exists libcdio_paranoia libcdio_cdda; then
+                  echo "Missing libcdio-paranoia development files; skipping --enable-libcdio" >> ../dist/unavailable-options.txt
+                  continue
+                fi
                 if [[ "$option" == libsvtjpegxs ]] \
                    && ! pkg-config --exists 'SvtJpegxs >= 0.10.0'; then
                   installed=$(pkg-config --modversion SvtJpegxs 2>/dev/null || echo unknown)
@@ -212,10 +245,14 @@ jobs:
           cp ffbuild/config.log ../dist/config.log
           make -j2
           cp ffmpeg.exe ffprobe.exe ../dist/
-          if [[ -f ffplay.exe ]]; then cp ffplay.exe ../dist/; fi
+          if pacman -Q "${MINGW_PACKAGE_PREFIX}-SDL2" >/dev/null 2>&1; then
+            test -f ffplay.exe || { echo 'SDL2 is installed but ffplay.exe is missing' >&2; exit 1; }
+            cp ffplay.exe ../dist/
+          fi
           cp ../LICENSE.md ../dist/ 2>/dev/null || true
           cp ../COPYING.GPLv3 ../dist/ 2>/dev/null || true
           cp ../missing-packages.txt ../dist/
+          if [[ -f ../x264-source.txt ]]; then cp ../x264-source.txt ../dist/; fi
 
       - name: Bundle runtime DLLs and check features
         env:
@@ -261,4 +298,5 @@ jobs:
             build/ffbuild/config.log
             dist/*.txt
             missing-packages.txt
+            x264-source.txt
           if-no-files-found: ignore
