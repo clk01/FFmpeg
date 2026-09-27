@@ -66,10 +66,16 @@ jobs:
           )
           if [[ "$BUILD_ARCH" != arm64 ]]; then
             packages+=(nasm ffnvcodec-headers amf-headers)
+            packages+=(
+              aribb24 libaribcaption libbs2b libcaca libcdio
+              dvdnav dvdread libmysofa qrencode quirc snappy
+              zeromq shine twolame rubberband librist codec2
+              openh264 vmaf vvenc kvazaar xavs2 libdavs2 oapv
+            )
           fi
           if [[ "$BUILD_ARCH" == x64 ]]; then
-            # Give x64 additional encoders and analysis/filter libraries.
-            packages+=(openh264 vmaf codec2 rubberband twolame librist)
+            # Larger Windows-only toolkit and extra experimental codecs.
+            packages+=(svt-jpeg-xs frei0r-plugins vulkan-headers)
           fi
           : > missing-packages.txt
           for name in "${packages[@]}"; do
@@ -134,14 +140,30 @@ jobs:
             'librsvg:librsvg' 'libvpl:libvpl'
             'libzvbi:libzvbi'
           )
+          if [[ "$BUILD_ARCH" != arm64 ]]; then
+            optional+=(
+              'aribb24:libaribb24' 'libaribcaption:libaribcaption'
+            'libbs2b:libbs2b' 'libcaca:libcaca'
+            'libcdio:libcdio' 'dvdnav:libdvdnav'
+            'dvdread:libdvdread' 'libmysofa:libmysofa'
+            'qrencode:libqrencode' 'quirc:libquirc'
+            'snappy:libsnappy' 'zeromq:libzmq'
+            'shine:libshine' 'twolame:libtwolame'
+            'rubberband:librubberband' 'librist:librist'
+            'codec2:libcodec2' 'openh264:libopenh264'
+            'vmaf:libvmaf' 'vvenc:libvvenc'
+            'kvazaar:libkvazaar' 'xavs2:libxavs2'
+            'libdavs2:libdavs2' 'oapv:liboapv'
+            )
+          fi
           if [[ "$BUILD_ARCH" == x64 ]]; then
             optional+=(
-              'openh264:libopenh264' 'vmaf:libvmaf'
-              'codec2:libcodec2' 'rubberband:librubberband'
-              'twolame:libtwolame' 'librist:librist'
+              'svt-jpeg-xs:libsvtjpegxs'
+              'frei0r-plugins:frei0r'
             )
           fi
           configure_help=$(../configure --help)
+          : > ../dist/unavailable-options.txt
           for item in "${optional[@]}"; do
             package=${item%%:*}
             option_list=${item#*:}
@@ -150,10 +172,24 @@ jobs:
               for option in "${options[@]}"; do
                 if grep -Fq -- "--enable-${option} " <<< "$configure_help"; then
                   flags+=("--enable-${option}")
+                else
+                  echo "Unsupported by this FFmpeg checkout: --enable-${option}" >> ../dist/unavailable-options.txt
                 fi
               done
+            else
+              echo "Missing package: ${MINGW_PACKAGE_PREFIX}-${package} (${option_list})" >> ../dist/unavailable-options.txt
             fi
           done
+          if [[ "$BUILD_ARCH" != arm64 ]]; then
+            for feature in 'ffnvcodec-headers:nvenc' 'amf-headers:amf'; do
+              header_package=${feature%%:*}
+              option=${feature#*:}
+              if pacman -Q "${MINGW_PACKAGE_PREFIX}-${header_package}" >/dev/null 2>&1 \
+                 && grep -Fq -- "--enable-${option} " <<< "$configure_help"; then
+                flags+=("--enable-${option}")
+              fi
+            done
+          fi
           if pacman -Q "${MINGW_PACKAGE_PREFIX}-SDL2" >/dev/null 2>&1; then
             : # FFplay is enabled by default when SDL2 is present.
           else
@@ -193,6 +229,7 @@ jobs:
           dist/ffmpeg.exe -hide_banner -decoders > dist/decoders.txt
           dist/ffmpeg.exe -hide_banner -filters > dist/filters.txt
           dist/ffmpeg.exe -hide_banner -protocols > dist/protocols.txt
+          dist/ffmpeg.exe -hide_banner -buildconf > dist/buildconf.txt
           if [[ "$BUILD_ARCH" == x64 ]]; then
             required_encoders=(libx264 libx265 libvpx_vp9 libaom-av1 libopus libfdk_aac)
           elif [[ "$BUILD_ARCH" == x86 ]]; then
