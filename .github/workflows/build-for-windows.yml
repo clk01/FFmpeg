@@ -126,3 +126,104 @@ jobs:
             'fontconfig:libfontconfig' 'fribidi:libfribidi'
             'harfbuzz:libharfbuzz' 'libbluray:libbluray'
             'libgme:libgme' 'libmodplug:libmodplug'
+            'libsoxr:libsoxr' 'zimg:libzimg' 'vid.stab:libvidstab'
+            'libxml2:libxml2' 'libssh:libssh' 'srt:libsrt'
+            'rtmpdump:librtmp' 'xvidcore:libxvid'
+            'liblc3:liblc3' 'rav1e:librav1e'
+            'svt-av1:libsvtav1' 'libplacebo:libplacebo'
+            'librsvg:librsvg' 'libvpl:libvpl'
+            'libzvbi:libzvbi'
+          )
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            optional+=(
+              'openh264:libopenh264' 'vmaf:libvmaf'
+              'codec2:libcodec2' 'rubberband:librubberband'
+              'twolame:libtwolame' 'librist:librist'
+            )
+          fi
+          configure_help=$(../configure --help)
+          for item in "${optional[@]}"; do
+            package=${item%%:*}
+            option_list=${item#*:}
+            if pacman -Q "${MINGW_PACKAGE_PREFIX}-${package}" >/dev/null 2>&1; then
+              IFS=, read -ra options <<< "$option_list"
+              for option in "${options[@]}"; do
+                if grep -Fq -- "--enable-${option} " <<< "$configure_help"; then
+                  flags+=("--enable-${option}")
+                fi
+              done
+            fi
+          done
+          if pacman -Q "${MINGW_PACKAGE_PREFIX}-SDL2" >/dev/null 2>&1; then
+            : # FFplay is enabled by default when SDL2 is present.
+          else
+            flags+=(--disable-ffplay)
+          fi
+          if [[ "$BUILD_ARCH" == arm64 ]]; then
+            flags+=(--arch=arm64)
+          elif [[ "$BUILD_ARCH" == x86 ]]; then
+            flags+=(--arch=x86)
+          else
+            flags+=(--arch=x86_64)
+          fi
+          printf '%s\n' "${flags[@]}" > ../dist/configure-options.txt
+          if ! ../configure "${flags[@]}"; then
+            cp ffbuild/config.log ../dist/config.log 2>/dev/null || true
+            exit 1
+          fi
+          cp ffbuild/config.log ../dist/config.log
+          make -j2
+          cp ffmpeg.exe ffprobe.exe ../dist/
+          if [[ -f ffplay.exe ]]; then cp ffplay.exe ../dist/; fi
+          cp ../LICENSE.md ../dist/ 2>/dev/null || true
+          cp ../COPYING.GPLv3 ../dist/ 2>/dev/null || true
+          cp ../missing-packages.txt ../dist/
+
+      - name: Bundle runtime DLLs and check features
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          # A static FFmpeg link may still depend on MSYS2 runtime DLLs.
+          # Include all DLLs from this architecture to avoid missing transitive
+          # dependencies on a clean Windows installation.
+          cp "$MINGW_PREFIX"/bin/*.dll dist/
+          dist/ffmpeg.exe -hide_banner -version > dist/version.txt
+          dist/ffmpeg.exe -hide_banner -encoders > dist/encoders.txt
+          dist/ffmpeg.exe -hide_banner -decoders > dist/decoders.txt
+          dist/ffmpeg.exe -hide_banner -filters > dist/filters.txt
+          dist/ffmpeg.exe -hide_banner -protocols > dist/protocols.txt
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            required_encoders=(libx264 libx265 libvpx_vp9 libaom-av1 libopus libfdk_aac)
+          elif [[ "$BUILD_ARCH" == x86 ]]; then
+            required_encoders=(libx264 libx265 libopus)
+          else
+            required_encoders=()
+          fi
+          for encoder in "${required_encoders[@]}"; do
+            if ! awk -v name="$encoder" '$2 == name { found=1 } END { exit !found }' dist/encoders.txt; then
+              echo "Required encoder missing: $encoder" >&2
+              exit 1
+            fi
+          done
+          if [[ "$BUILD_ARCH" != arm64 ]]; then
+            dist/ffprobe.exe -version > /dev/null
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-windows-${{ matrix.arch }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload configuration log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            build/ffbuild/config.log
+            dist/configure-options.txt
+            missing-packages.txt
+          if-no-files-found: ignore
