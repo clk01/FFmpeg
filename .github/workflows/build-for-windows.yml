@@ -38,13 +38,14 @@ jobs:
           install: >-
             make git diffutils pkgconf
             mingw-w64-${{ matrix.prefix }}-cc
+            mingw-w64-${{ matrix.prefix }}-binutils
 
       - name: Install available Windows libraries
         env:
           BUILD_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist dist-static dist-shared
           # All names are MSYS2 package suffixes. Some optional packages
           # exist only for one architecture; record these gaps.
           packages=(
@@ -124,13 +125,12 @@ jobs:
           BUILD_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p build
-          cd build
+          mkdir -p build-static
+          cd build-static
           help_text=$(../configure --help)
           base=(
             --target-os=mingw32 --enable-gpl --enable-version3
-            --enable-nonfree --enable-static --disable-shared
-            --pkg-config-flags=--static --disable-debug --disable-doc
+            --enable-nonfree --disable-debug --disable-doc
           )
           if [[ "$BUILD_ARCH" == x86 ]]; then
             base+=(--arch=x86)
@@ -219,122 +219,191 @@ jobs:
           # FFmpeg's external-library probes catch incompatible APIs as well
           # as missing .pc files. Retry only the optional feature named in
           # the first failure; core codecs are never removed.
-          configured=false
-          for attempt in $(seq 1 20); do
-            flags=("${base[@]}" "${core[@]}" "${optional[@]}")
-            printf '%s\n' "${flags[@]}" > ../dist/configure-options.txt
-            if ../configure "${flags[@]}" > "../dist/configure-attempt-${attempt}.txt" 2>&1; then
-              configured=true
-              break
+          # Separate object trees are required: configure and object files for
+          # static FFmpeg libraries must never be reused for shared DLLs.
+          cd ..
+          for variant in static shared; do
+            mkdir -p "build-${variant}"
+            cd "build-${variant}"
+            if [[ "$variant" == static ]]; then
+              mode=(--enable-static --disable-shared --pkg-config-flags=--static)
+            else
+              mode=(--enable-shared --disable-static)
             fi
-            error=$(grep -E '^ERROR:|^Unknown option' "../dist/configure-attempt-${attempt}.txt" | tail -1 || true)
-            [[ -n "$error" ]] || { cat "../dist/configure-attempt-${attempt}.txt"; exit 1; }
-            echo "$error" >&2
-            normalized=${error,,}
-            normalized=${normalized//-/_}
-            drop=
-            for option in "${optional[@]}"; do
-              name=${option#--enable-}
-              name=${name//-/_}
-              alias=${name#lib}
-              if [[ "$normalized" == *"$name"* ]] \
-                 || [[ ${#alias} -ge 5 && "$normalized" == *"$alias"* ]]; then
-                drop=$option
+            selected=("${optional[@]}")
+            configured=false
+            for attempt in $(seq 1 20); do
+              flags=("${base[@]}" "${mode[@]}" "${core[@]}" "${selected[@]}")
+              printf '%s\n' "${flags[@]}" > "../dist-${variant}/configure-options.txt"
+              if ../configure "${flags[@]}" > "../dist-${variant}/configure-attempt-${attempt}.txt" 2>&1; then
+                configured=true
                 break
               fi
+              error=$(grep -E '^ERROR:|^Unknown option' "../dist-${variant}/configure-attempt-${attempt}.txt" | tail -1 || true)
+              [[ -n "$error" ]] || { cat "../dist-${variant}/configure-attempt-${attempt}.txt"; exit 1; }
+              echo "${variant}: $error" >&2
+              normalized=${error,,}
+              normalized=${normalized//-/_}
+              drop=
+              for option in "${selected[@]}"; do
+                name=${option#--enable-}
+                name=${name//-/_}
+                alias=${name#lib}
+                if [[ "$normalized" == *"$name"* ]] \
+                   || [[ ${#alias} -ge 5 && "$normalized" == *"$alias"* ]]; then
+                  drop=$option
+                  break
+                fi
+              done
+              [[ -n "$drop" ]] || { cat "../dist-${variant}/configure-attempt-${attempt}.txt"; exit 1; }
+              echo "$drop: $error" >> ../dist/skipped-options.txt
+              next=()
+              for option in "${selected[@]}"; do
+                [[ "$option" == "$drop" ]] || next+=("$option")
+              done
+              selected=("${next[@]}")
             done
-            [[ -n "$drop" ]] || { cat "../dist/configure-attempt-${attempt}.txt"; exit 1; }
-            echo "$drop: $error" >> ../dist/skipped-options.txt
-            next=()
-            for option in "${optional[@]}"; do
-              [[ "$option" == "$drop" ]] || next+=("$option")
-            done
-            optional=("${next[@]}")
+            [[ "$configured" == true ]] || { echo "${variant} configuration retries exhausted" >&2; exit 1; }
+            cp ffbuild/config.log "../dist-${variant}/config.log"
+            cat "../dist-${variant}"/configure-attempt-*.txt > "../dist-${variant}/configure-history.txt"
+            cp ../dist/missing-packages.txt ../dist/skipped-options.txt "../dist-${variant}/"
+            cd ..
           done
-          [[ "$configured" == true ]] || { echo 'Configuration retries exhausted' >&2; exit 1; }
-          cp ffbuild/config.log ../dist/config.log
-          cat ../dist/configure-attempt-*.txt >> ../dist/configure-history.txt
 
-      - name: Compile and verify
+      - name: Compile, package and verify both variants
         env:
           BUILD_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          cd build
-          make -j2 > ../dist/build.log 2>&1 || {
-            tail -100 ../dist/build.log
-            exit 1
-          }
-          cp ffmpeg.exe ffprobe.exe ffplay.exe ../dist/
-          cd ..
-          # External libraries are often DLL-backed even for a static FFmpeg
-          # build. Bundle the target architecture's MinGW runtime DLLs.
-          cp "$MINGW_PREFIX"/bin/*.dll dist/
-          dist/ffmpeg.exe -hide_banner -version > dist/version.txt
-          dist/ffmpeg.exe -hide_banner -buildconf > dist/buildconf.txt
-          dist/ffmpeg.exe -hide_banner -encoders > dist/encoders.txt
-          dist/ffmpeg.exe -hide_banner -decoders > dist/decoders.txt
-          dist/ffmpeg.exe -hide_banner -filters > dist/filters.txt
-          dist/ffprobe.exe -version > /dev/null
-          dist/ffplay.exe -version > /dev/null
-          if [[ "$BUILD_ARCH" == x64 ]]; then
-            required=(libx264 libx265 libvpx-vp9 libaom-av1 libopus libfdk_aac aac)
-          else
-            required=(libx264 libopus aac)
-          fi
-          for name in "${required[@]}"; do
-            awk -v name="$name" '$2 == name { found=1 } END { exit !found }' dist/encoders.txt || {
-              echo "Required encoder missing: $name" >&2
+          for variant in static shared; do
+            build="build-${variant}"
+            output="dist-${variant}"
+            if ! make -C "$build" -j2 > "$output/build.log" 2>&1; then
+              tail -100 "$output/build.log"
               exit 1
-            }
-          done
-          awk '$2 == "aac" { found=1 } END { exit !found }' dist/decoders.txt || {
-            echo 'Required AAC decoder missing' >&2
-            exit 1
-          }
-          # Exercise both the native AAC path and the external FDK encoder
-          # where it is mandatory. Listing an encoder alone is not sufficient.
-          for encoder in aac; do
-            dist/ffmpeg.exe -hide_banner -loglevel error -f lavfi \
-              -i 'sine=frequency=1000:duration=0.25' -c:a "$encoder" \
-              -y "dist/smoke-${encoder}.m4a"
-            dist/ffmpeg.exe -hide_banner -loglevel error \
-              -i "dist/smoke-${encoder}.m4a" -f null -
-            rm "dist/smoke-${encoder}.m4a"
-          done
-          if [[ "$BUILD_ARCH" == x64 ]]; then
-            dist/ffmpeg.exe -hide_banner -loglevel error -f lavfi \
-              -i 'sine=frequency=1000:duration=0.25' -c:a libfdk_aac \
-              -y dist/smoke-fdk.m4a
-            dist/ffmpeg.exe -hide_banner -loglevel error \
-              -i dist/smoke-fdk.m4a -f null -
-            rm dist/smoke-fdk.m4a
-          fi
-          {
-            echo 'Verified encoders:'
-            printf '  %s\n' "${required[@]}"
-            echo 'Verified decoders: aac'
-            echo 'AAC audio encode and decode smoke tests: passed'
-            echo 'The complete enabled lists are encoders.txt and decoders.txt.'
-            echo 'Unavailable packages and skipped options are listed separately.'
-          } > dist/verification.txt
-          {
-            printf 'architecture: %s\n' "$BUILD_ARCH"
-            for name in aac libfdk_aac libx264 libx265 libvpx-vp9 libaom-av1 libopus; do
-              if awk -v name="$name" '$2 == name { found=1 } END { exit !found }' dist/encoders.txt; then
-                printf '%s: enabled\n' "$name"
-              else
-                printf '%s: unavailable\n' "$name"
-              fi
+            fi
+            cp "$build/ffmpeg.exe" "$build/ffprobe.exe" "$build/ffplay.exe" "$output/"
+            if [[ "$variant" == shared ]]; then
+              # The FFmpeg-built avcodec/avformat/etc. DLLs are part of the
+              # dynamic build and must travel with its executables.
+              while IFS= read -r -d '' dll; do
+                cp "$dll" "$output/"
+              done < <(find "$build" -maxdepth 2 -type f -iname '*.dll' -print0)
+              compgen -G "$output/*.dll" >/dev/null || {
+                echo 'Shared build produced no FFmpeg DLLs' >&2
+                exit 1
+              }
+            fi
+            # Copy the external runtime DLL closure for this architecture,
+            # rather than every unrelated DLL installed in MSYS2.
+            declare -A installed=() seen=()
+            for dll in "$MINGW_PREFIX"/bin/*.dll; do
+              key=${dll##*/}
+              installed["${key,,}"]="$dll"
             done
-          } > dist/codec-audit.txt
-          cp LICENSE.md dist/ 2>/dev/null || true
-          cp COPYING.GPLv3 dist/ 2>/dev/null || true
+            queue=("$output"/*.exe "$output"/*.dll)
+            for ((i=0; i<${#queue[@]}; i++)); do
+              file=${queue[i]}
+              [[ -f "$file" ]] || continue
+              while IFS= read -r dep; do
+                [[ -n "$dep" ]] || continue
+                key=${dep,,}
+                [[ -z "${seen[$key]:-}" ]] || continue
+                seen[$key]=1
+                [[ -f "$output/$dep" ]] && continue
+                source=${installed[$key]:-}
+                if [[ -n "$source" ]]; then
+                  cp "$source" "$output/"
+                  queue+=("$output/$dep")
+                else
+                  printf '%s (imported by %s)\n' "$dep" "${file##*/}" >> "$output/system-or-missing-dlls.txt"
+                fi
+              done < <(objdump -p "$file" | awk '/DLL Name:/ { print $3 }')
+            done
+            unset installed seen
+            # Test with the MinGW bin directory removed from PATH: running on
+            # the runner must not accidentally hide a missing packaged DLL.
+            (
+              cd "$output"
+              export PATH=/usr/bin:/c/Windows/System32:/c/Windows
+              ./ffmpeg.exe -hide_banner -version > version.txt
+              ./ffmpeg.exe -hide_banner -buildconf > buildconf.txt
+              ./ffmpeg.exe -hide_banner -encoders > encoders.txt
+              ./ffmpeg.exe -hide_banner -decoders > decoders.txt
+              ./ffmpeg.exe -hide_banner -filters > filters.txt
+              ./ffprobe.exe -version > /dev/null
+              ./ffplay.exe -version > /dev/null
+              if [[ "$BUILD_ARCH" == x64 ]]; then
+                required=(libx264 libx265 libvpx-vp9 libaom-av1 libopus libfdk_aac aac)
+              else
+                required=(libx264 libopus aac)
+              fi
+              for name in "${required[@]}"; do
+                awk -v name="$name" '$2 == name { found=1 } END { exit !found }' encoders.txt || {
+                  echo "${BUILD_ARCH} ${variant}: required encoder missing: $name" >&2
+                  exit 1
+                }
+              done
+              awk '$2 == "aac" { found=1 } END { exit !found }' decoders.txt || {
+                echo 'Required AAC decoder missing' >&2
+                exit 1
+              }
+              ./ffmpeg.exe -hide_banner -loglevel error -f lavfi \
+                -i 'sine=frequency=1000:duration=0.25' -c:a aac -y smoke-aac.m4a
+              ./ffmpeg.exe -hide_banner -loglevel error -i smoke-aac.m4a -f null -
+              rm smoke-aac.m4a
+              if [[ "$BUILD_ARCH" == x64 ]]; then
+                ./ffmpeg.exe -hide_banner -loglevel error -f lavfi \
+                  -i 'sine=frequency=1000:duration=0.25' -c:a libfdk_aac -y smoke-fdk.m4a
+                ./ffmpeg.exe -hide_banner -loglevel error -i smoke-fdk.m4a -f null -
+                rm smoke-fdk.m4a
+              fi
+              {
+                printf 'architecture: %s\nvariant: %s\n' "$BUILD_ARCH" "$variant"
+                for name in aac libfdk_aac libx264 libx265 libvpx-vp9 libaom-av1 libopus; do
+                  if awk -v name="$name" '$2 == name { found=1 } END { exit !found }' encoders.txt; then
+                    printf '%s: enabled\n' "$name"
+                  else
+                    printf '%s: unavailable\n' "$name"
+                  fi
+                done
+                printf 'encoder count: %s\n' "$(awk '$1 ~ /^[VAS]/ { n++ } END { print n+0 }' encoders.txt)"
+                printf 'decoder count: %s\n' "$(awk '$1 ~ /^[VAS]/ { n++ } END { print n+0 }' decoders.txt)"
+              } > codec-audit.txt
+              {
+                printf 'FFmpeg library type: %s\n' "$variant"
+                printf 'Executable bytes: %s\n' "$(du -cb *.exe | tail -1 | awk '{print $1}')"
+                printf 'Bundled DLL bytes: %s\n' "$(find . -maxdepth 1 -iname '*.dll' -printf '%s\n' | awk '{n+=$1} END {print n+0}')"
+                printf 'Bundled DLL count: %s\n' "$(find . -maxdepth 1 -iname '*.dll' | wc -l)"
+                echo 'Static refers to FFmpeg libraries; external codecs may still require DLLs.'
+              } > size-report.txt
+            )
+            cp LICENSE.md "$output/" 2>/dev/null || true
+            cp COPYING.GPLv3 "$output/" 2>/dev/null || true
+          done
+          # Surface any codec difference between the two linking modes.
+          {
+            echo 'Encoders present in only one variant (static | shared):'
+            comm -3 \
+              <(awk '$1 ~ /^[VAS]/ {print $2}' dist-static/encoders.txt | sort -u) \
+              <(awk '$1 ~ /^[VAS]/ {print $2}' dist-shared/encoders.txt | sort -u)
+            echo 'Decoders present in only one variant (static | shared):'
+            comm -3 \
+              <(awk '$1 ~ /^[VAS]/ {print $2}' dist-static/decoders.txt | sort -u) \
+              <(awk '$1 ~ /^[VAS]/ {print $2}' dist-shared/decoders.txt | sort -u)
+          } > dist-shared/variant-differences.txt
 
       - uses: actions/upload-artifact@v6
         with:
-          name: ffmpeg-windows-${{ matrix.arch }}-${{ github.run_number }}
-          path: dist/
+          name: ffmpeg-windows-${{ matrix.arch }}-static-${{ github.run_number }}
+          path: dist-static/
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ffmpeg-windows-${{ matrix.arch }}-shared-${{ github.run_number }}
+          path: dist-shared/
           if-no-files-found: error
           retention-days: 30
 
@@ -345,5 +414,8 @@ jobs:
           name: ffmpeg-failure-${{ matrix.arch }}-${{ github.run_number }}
           path: |
             dist/
-            build/ffbuild/config.log
+            dist-static/
+            dist-shared/
+            build-static/ffbuild/config.log
+            build-shared/ffbuild/config.log
           if-no-files-found: ignore
