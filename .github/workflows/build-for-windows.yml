@@ -45,7 +45,7 @@ jobs:
           BUILD_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p dist dist-static dist-shared
+          mkdir -p dist dist-static dist-shared dist-standalone
           # All names are MSYS2 package suffixes. Some optional packages
           # exist only for one architecture; record these gaps.
           packages=(
@@ -407,6 +407,118 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Build and validate three standalone EXEs
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p build-standalone dist/standalone-diagnostics
+          # FFmpeg's native codecs stay enabled, including native AAC. These
+          # external libraries have static archives in the MSYS2 packages.
+          for name in SDL2 x264 opus; do
+            [[ -s "$MINGW_PREFIX/lib/lib${name}.a" ]] || {
+              echo "Standalone build requires static lib${name}.a" >&2
+              exit 1
+            }
+          done
+          flags=(
+            --target-os=mingw32 --enable-gpl --enable-version3
+            --enable-nonfree --enable-static --disable-shared
+            --disable-autodetect --enable-sdl2 --enable-ffplay
+            --enable-libx264 --enable-libopus
+            --pkg-config-flags=--static --extra-ldflags=-static
+            --extra-ldexeflags=-static --disable-debug --disable-doc
+          )
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            [[ -s "$MINGW_PREFIX/lib/libfdk-aac.a" ]] || {
+              echo 'Standalone x64 requires static libfdk-aac.a' >&2
+              exit 1
+            }
+            flags+=(--arch=x86_64 --enable-libfdk-aac)
+          else
+            flags+=(--arch=x86)
+          fi
+          printf '%s\n' "${flags[@]}" > dist/standalone-diagnostics/configure-options.txt
+          (
+            cd build-standalone
+            if ! ../configure "${flags[@]}" > ../dist/standalone-diagnostics/configure.txt 2>&1; then
+              tail -100 ../dist/standalone-diagnostics/configure.txt
+              exit 1
+            fi
+            cp ffbuild/config.log ../dist/standalone-diagnostics/config.log
+          )
+          if ! make -C build-standalone -j2 > dist/standalone-diagnostics/build.log 2>&1; then
+            tail -100 dist/standalone-diagnostics/build.log
+            exit 1
+          fi
+          cp build-standalone/ffmpeg.exe build-standalone/ffprobe.exe \
+            build-standalone/ffplay.exe dist-standalone/
+          # Reject imports supplied by MinGW and imports absent from Windows.
+          # Check each of the three executables: FFplay can depend on SDL2.dll
+          # even when ffmpeg.exe has no third-party imports.
+          for exe in dist-standalone/*.exe; do
+            objdump -p "$exe" | awk '/DLL Name:/ {print $3}' \
+              > "dist/standalone-diagnostics/${exe##*/}-imports.txt"
+            while IFS= read -r dep; do
+              [[ -n "$dep" ]] || continue
+              if compgen -G "$MINGW_PREFIX/bin/$dep" >/dev/null; then
+                echo "Standalone ${exe##*/} imports MinGW DLL: $dep" >&2
+                exit 1
+              fi
+              case "${dep,,}" in
+                api-ms-win-*.dll|ext-ms-win-*.dll) continue ;;
+              esac
+              if [[ ! -f "/c/Windows/System32/$dep" \
+                 && ! -f "/c/Windows/SysWOW64/$dep" ]]; then
+                echo "Standalone ${exe##*/} imports non-system DLL: $dep" >&2
+                exit 1
+              fi
+            done < "dist/standalone-diagnostics/${exe##*/}-imports.txt"
+          done
+          (
+            cd dist-standalone
+            export PATH=/usr/bin:/c/Windows/System32:/c/Windows
+            ./ffmpeg.exe -hide_banner -encoders \
+              > ../dist/standalone-diagnostics/encoders.txt
+            ./ffmpeg.exe -hide_banner -decoders \
+              > ../dist/standalone-diagnostics/decoders.txt
+            ./ffprobe.exe -version > /dev/null
+            ./ffplay.exe -version > /dev/null
+            for name in aac libx264 libopus; do
+              awk -v name="$name" '$2 == name {found=1} END {exit !found}' \
+                ../dist/standalone-diagnostics/encoders.txt || {
+                  echo "Standalone encoder missing: $name" >&2
+                  exit 1
+                }
+            done
+            if [[ "$BUILD_ARCH" == x64 ]]; then
+              awk '$2 == "libfdk_aac" {found=1} END {exit !found}' \
+                ../dist/standalone-diagnostics/encoders.txt || exit 1
+            fi
+            ./ffmpeg.exe -hide_banner -loglevel error -f lavfi \
+              -i 'sine=frequency=1000:duration=0.25' -c:a aac \
+              -y ../dist/standalone-diagnostics/smoke.m4a
+            ./ffmpeg.exe -hide_banner -loglevel error \
+              -i ../dist/standalone-diagnostics/smoke.m4a -f null -
+            rm ../dist/standalone-diagnostics/smoke.m4a
+          )
+          [[ $(find dist-standalone -maxdepth 1 -type f | wc -l) -eq 3 ]] || {
+            echo 'Standalone artifact must contain exactly three EXEs' >&2
+            exit 1
+          }
+          echo 'Standalone encoders compared with full static variant:'
+          printf 'standalone: '
+          awk '$1 ~ /^[VAS]/ {n++} END {print n+0}' dist/standalone-diagnostics/encoders.txt
+          printf 'full static: '
+          awk '$1 ~ /^[VAS]/ {n++} END {print n+0}' dist-static/encoders.txt
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ffmpeg-windows-${{ matrix.arch }}-standalone-${{ github.run_number }}
+          path: dist-standalone/
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v6
@@ -416,6 +528,7 @@ jobs:
             dist/
             dist-static/
             dist-shared/
+            dist-standalone/
             build-static/ffbuild/config.log
             build-shared/ffbuild/config.log
           if-no-files-found: ignore
