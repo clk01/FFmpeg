@@ -1,192 +1,349 @@
-name: Build FFmpeg for Windows (x86 + x64, many codecs + libsoxr)
+name: FFmpeg Windows x64 and x86
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
   workflow_dispatch:
+  push:
+    tags:
+      - 'build-*'
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-2022
+    timeout-minutes: 360
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
-          - name: win64
-            msystem: MINGW64
-            mingw_arch: x86_64
-            ff_arch: x86_64
-            prefix: /mingw64
-          - name: win32
-            msystem: MINGW32
-            mingw_arch: i686
-            ff_arch: x86
-            prefix: /mingw32
+          - { arch: x64, msystem: UCRT64, prefix: ucrt-x86_64 }
+          - { arch: x86, msystem: MINGW32, prefix: i686 }
+
+    defaults:
+      run:
+        shell: msys2 {0}
 
     steps:
-      - name: Checkout FFmpeg source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          submodules: true
+          persist-credentials: false
 
-      # 初始化 MSYS2
-      - name: Setup MSYS2 base
-        uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
           update: true
+          install: >-
+            make git diffutils pkgconf
+            mingw-w64-${{ matrix.prefix }}-cc
 
-      # 安装工具链 + 编解码库 + mingw 版 pkgconf，带重试
-      - name: Install toolchain and codec libs (with retry)
-        shell: msys2 {0}
+      - name: Install available Windows libraries
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
         run: |
-          set -e
-
-          pacman -Sy --noconfirm
-
-          install_pkgs() {
-            pacman -S --noconfirm --needed \
-              base-devel \
-              git \
-              yasm \
-              nasm \
-              mingw-w64-${{ matrix.mingw_arch }}-pkgconf \
-              mingw-w64-${{ matrix.mingw_arch }}-toolchain \
-              mingw-w64-${{ matrix.mingw_arch }}-x264 \
-              mingw-w64-${{ matrix.mingw_arch }}-x265 \
-              mingw-w64-${{ matrix.mingw_arch }}-libvpx \
-              mingw-w64-${{ matrix.mingw_arch }}-aom \
-              mingw-w64-${{ matrix.mingw_arch }}-opus \
-              mingw-w64-${{ matrix.mingw_arch }}-libvorbis \
-              mingw-w64-${{ matrix.mingw_arch }}-lame \
-              mingw-w64-${{ matrix.mingw_arch }}-libwebp \
-              mingw-w64-${{ matrix.mingw_arch }}-libtheora \
-              mingw-w64-${{ matrix.mingw_arch }}-openjpeg2 \
-              mingw-w64-${{ matrix.mingw_arch }}-speex \
-              mingw-w64-${{ matrix.mingw_arch }}-rtmpdump \
-              mingw-w64-${{ matrix.mingw_arch }}-srt \
-              mingw-w64-${{ matrix.mingw_arch }}-vid.stab \
-              mingw-w64-${{ matrix.mingw_arch }}-libsoxr \
-              mingw-w64-${{ matrix.mingw_arch }}-zimg \
-              mingw-w64-${{ matrix.mingw_arch }}-xvidcore \
-              mingw-w64-${{ matrix.mingw_arch }}-SDL2
-          }
-
-          n=0
-          until [ $n -ge 3 ]
-          do
-            install_pkgs && break
-            n=$((n+1))
-            echo "pacman failed, retry $n/3..."
-            sleep 30
-          done
-
-          if [ $n -ge 3 ]; then
-            echo "pacman failed after 3 retries, giving up."
-            exit 1
+          set -euo pipefail
+          mkdir -p dist
+          # All names are MSYS2 package suffixes. Some optional packages
+          # exist only for one architecture; record these gaps.
+          packages=(
+            nasm SDL2 libx264 x265 aom dav1d libvpx svt-av1
+            fdk-aac opus lame libvorbis libtheora speex gsm
+            opencore-amr openh264 openjpeg2 libjxl libwebp xvidcore
+            libass freetype fontconfig fribidi harfbuzz zimg
+            libsoxr libbluray libgme libmodplug liblc3
+            rubberband vid.stab vmaf libplacebo librsvg
+            libxml2 zlib bzip2 srt libssh rtmpdump
+            libzvbi codec2 twolame shine librist
+            aribb24 libaribcaption libbs2b libcaca
+            libcdio libcdio-paranoia libmysofa qrencode quirc
+            snappy zeromq vvenc kvazaar xavs2 libdavs2 oapv
+            libvpl vulkan vulkan-headers ffnvcodec-headers amf-headers
+          )
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            packages+=(frei0r-plugins svt-jpeg-xs rav1e)
           fi
-
-      # 只有 64 位额外装 fdk-aac + vmaf，同样带重试
-      - name: "Install extra codecs (64-bit only: fdk-aac, vmaf)"
-        if: matrix.name == 'win64'
-        shell: msys2 {0}
-        run: |
-          set -e
-
-          install_extra() {
-            pacman -S --noconfirm --needed \
-              mingw-w64-x86_64-fdk-aac \
-              mingw-w64-x86_64-vmaf
-          }
-
-          n=0
-          until [ $n -ge 3 ]
-          do
-            install_extra && break
-            n=$((n+1))
-            echo "pacman (extra) failed, retry $n/3..."
-            sleep 30
+          available=()
+          : > dist/missing-packages.txt
+          for name in "${packages[@]}"; do
+            pkg="${MINGW_PACKAGE_PREFIX}-${name}"
+            if pacman -Si "$pkg" >/dev/null 2>&1; then
+              available+=("$pkg")
+            else
+              echo "$pkg" >> dist/missing-packages.txt
+            fi
           done
-
-          if [ $n -ge 3 ]; then
-            echo "pacman extra packages failed after 3 retries, giving up."
-            exit 1
+          # Package metadata and mirrors can disagree during MSYS2 repo updates.
+          # If one package disappears, install the rest independently so an
+          # optional x86 codec does not cancel the entire transaction.
+          if ! pacman --noconfirm --needed -S "${available[@]}"; then
+            echo 'Batch install failed; retrying packages individually' >&2
+            for pkg in "${available[@]}"; do
+              if ! pacman --noconfirm --needed -S "$pkg"; then
+                echo "$pkg: unavailable during install" >> dist/missing-packages.txt
+              fi
+            done
           fi
-
-      - name: Configure FFmpeg
-        shell: msys2 {0}
-        run: |
-          cd "$GITHUB_WORKSPACE"
-
-          # 用对应前缀下的 toolchain + pkg-config
-          export PATH="${{ matrix.prefix }}/bin:$PATH"
-
-          echo "Using pkg-config from: $(command -v pkg-config || echo 'not found')"
-          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<empty>}"
-
-          # 检测 libsoxr 是否能被 pkg-config 找到
-          SOXR_FLAG=""
-          if pkg-config --exists soxr; then
-            echo "Detected libsoxr via pkg-config, will enable --enable-libsoxr"
-            SOXR_FLAG="--enable-libsoxr"
+          # Core codecs and FFplay have to be present before a long build.
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            core_packages=(libx264 x265 libvpx aom opus fdk-aac SDL2)
           else
-            echo "WARNING: libsoxr not detected by pkg-config, building WITHOUT libsoxr"
+            core_packages=(opus SDL2)
           fi
+          for name in "${core_packages[@]}"; do
+            pacman -Q "${MINGW_PACKAGE_PREFIX}-${name}" >/dev/null || {
+              echo "Missing required ${BUILD_ARCH} dependency: ${name}" >&2
+              exit 1
+            }
+          done
 
-          EXTRA_FLAGS=""
-          # 64 位开启 libfdk-aac / libvmaf / nonfree
-          if [ "${{ matrix.name }}" = "win64" ]; then
-            EXTRA_FLAGS="$EXTRA_FLAGS --enable-libfdk-aac --enable-libvmaf --enable-nonfree"
-          fi
-
-          ./configure \
-            --prefix=${{ matrix.prefix }}/local-ffmpeg \
-            --arch=${{ matrix.ff_arch }} \
-            --target-os=mingw32 \
-            --enable-gpl \
-            --enable-version3 \
-            --disable-debug \
-            --enable-libx264 \
-            --enable-libx265 \
-            --enable-libvpx \
-            --enable-libaom \
-            --enable-libmp3lame \
-            --enable-libopus \
-            --enable-libvorbis \
-            --enable-libwebp \
-            --enable-libtheora \
-            --enable-libopenjpeg \
-            --enable-libspeex \
-            --enable-librtmp \
-            --enable-libsrt \
-            --enable-libvidstab \
-            --enable-libzimg \
-            --enable-libxvid \
-            --enable-sdl2 \
-            --extra-cflags="-O3" \
-            --extra-cxxflags="-O3" \
-            $SOXR_FLAG \
-            $EXTRA_FLAGS
-
-      - name: Build FFmpeg
-        shell: msys2 {0}
+      - name: Build x86 x264 when its MSYS2 library is unavailable
+        if: matrix.arch == 'x86'
         run: |
-          cd "$GITHUB_WORKSPACE"
-          make -j$(nproc)
+          set -euo pipefail
+          if pkg-config --exists x264; then
+            echo "Using MSYS2 libx264 $(pkg-config --modversion x264)"
+            exit 0
+          fi
+          if ! git clone --depth 1 https://code.videolan.org/videolan/x264.git x264-src; then
+            rm -rf x264-src
+            git clone --depth 1 https://github.com/mirror/x264.git x264-src
+          fi
+          cd x264-src
+          ./configure --host=i686-w64-mingw32 --prefix="$MINGW_PREFIX" \
+            --enable-static --disable-cli --disable-opencl
+          make -j2
           make install
+          pkg-config --exists x264
+          echo "x264 source commit: $(git rev-parse HEAD)" > ../dist/x264-source.txt
+          sed -i "/^${MINGW_PACKAGE_PREFIX}-libx264$/d" ../dist/missing-packages.txt
 
-      - name: Collect build artifacts
-        shell: msys2 {0}
+      - name: Select and configure codecs
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
         run: |
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p dist/${{ matrix.name }}
-          cp -a ${{ matrix.prefix }}/local-ffmpeg/bin dist/${{ matrix.name }}/bin
-          cp -a ${{ matrix.prefix }}/local-ffmpeg/lib dist/${{ matrix.name }}/lib || true
-          cp -a ${{ matrix.prefix }}/local-ffmpeg/include dist/${{ matrix.name }}/include || true
+          set -euo pipefail
+          mkdir -p build
+          cd build
+          help_text=$(../configure --help)
+          base=(
+            --target-os=mingw32 --enable-gpl --enable-version3
+            --enable-nonfree --enable-static --disable-shared
+            --pkg-config-flags=--static --disable-debug --disable-doc
+          )
+          if [[ "$BUILD_ARCH" == x86 ]]; then
+            base+=(--arch=x86)
+            core=(--enable-libx264 --enable-libopus)
+          else
+            base+=(--arch=x86_64)
+            core=(
+              --enable-libx264 --enable-libx265 --enable-libvpx
+              --enable-libaom --enable-libopus --enable-libfdk-aac
+            )
+          fi
+          for option in "${core[@]}"; do
+            grep -Fq -- "$option " <<< "$help_text" || {
+              echo "FFmpeg checkout lacks required option: $option" >&2
+              exit 1
+            }
+          done
+          # Mapping is package suffix : FFmpeg configure feature.
+          optional_map=(
+            'x265:libx265' 'libvpx:libvpx' 'aom:libaom'
+            'dav1d:libdav1d' 'svt-av1:libsvtav1'
+            'fdk-aac:libfdk-aac' 'opus:libopus' 'lame:libmp3lame'
+            'libvorbis:libvorbis' 'libtheora:libtheora'
+            'speex:libspeex' 'gsm:libgsm'
+            'opencore-amr:libopencore-amrnb,libopencore-amrwb'
+            'openh264:libopenh264' 'openjpeg2:libopenjpeg'
+            'libjxl:libjxl' 'libwebp:libwebp' 'xvidcore:libxvid'
+            'libass:libass' 'freetype:libfreetype'
+            'fontconfig:libfontconfig' 'fribidi:libfribidi'
+            'harfbuzz:libharfbuzz' 'zimg:libzimg'
+            'libsoxr:libsoxr' 'libbluray:libbluray'
+            'libgme:libgme' 'libmodplug:libmodplug'
+            'liblc3:liblc3' 'rubberband:librubberband'
+            'vid.stab:libvidstab' 'vmaf:libvmaf'
+            'libplacebo:libplacebo' 'librsvg:librsvg'
+            'libxml2:libxml2' 'srt:libsrt' 'libssh:libssh'
+            'rtmpdump:librtmp' 'libzvbi:libzvbi'
+            'codec2:libcodec2' 'twolame:libtwolame'
+            'shine:libshine' 'librist:librist'
+            'aribb24:libaribb24' 'libaribcaption:libaribcaption'
+            'libbs2b:libbs2b' 'libcaca:libcaca'
+            'libcdio:libcdio' 'libmysofa:libmysofa'
+            'qrencode:libqrencode' 'quirc:libquirc'
+            'snappy:libsnappy' 'zeromq:libzmq'
+            'vvenc:libvvenc' 'kvazaar:libkvazaar'
+            'xavs2:libxavs2' 'libdavs2:libdavs2' 'oapv:liboapv'
+          )
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            optional_map+=(
+              'rav1e:librav1e' 'frei0r-plugins:frei0r'
+              'svt-jpeg-xs:libsvtjpegxs'
+            )
+          fi
+          optional=()
+          : > ../dist/skipped-options.txt
+          for mapping in "${optional_map[@]}"; do
+            package=${mapping%%:*}
+            IFS=, read -ra features <<< "${mapping#*:}"
+            for feature in "${features[@]}"; do
+              option="--enable-${feature}"
+              if ! grep -Fq -- "$option " <<< "$help_text"; then
+                echo "$option: unsupported by this FFmpeg checkout" >> ../dist/skipped-options.txt
+              elif ! pacman -Q "${MINGW_PACKAGE_PREFIX}-${package}" >/dev/null 2>&1; then
+                echo "$option: MSYS2 package ${package} unavailable" >> ../dist/skipped-options.txt
+              elif [[ " ${core[*]} " == *" $option "* ]]; then
+                : # Already mandatory.
+              elif [[ "$feature" == libcdio ]] \
+                   && ! pkg-config --exists libcdio_cdda libcdio_paranoia; then
+                echo "$option: libcdio-paranoia development files missing" >> ../dist/skipped-options.txt
+              elif [[ "$feature" == libsvtjpegxs ]] \
+                   && ! pkg-config --exists 'SvtJpegxs >= 0.10.0'; then
+                echo "$option: SvtJpegxs >= 0.10.0 required" >> ../dist/skipped-options.txt
+              else
+                optional+=("$option")
+              fi
+            done
+          done
+          for feature in 'ffnvcodec-headers:nvenc' 'amf-headers:amf'; do
+            package=${feature%%:*}
+            option="--enable-${feature#*:}"
+            if pacman -Q "${MINGW_PACKAGE_PREFIX}-${package}" >/dev/null 2>&1 \
+               && grep -Fq -- "$option " <<< "$help_text"; then
+              optional+=("$option")
+            fi
+          done
+          # FFmpeg's external-library probes catch incompatible APIs as well
+          # as missing .pc files. Retry only the optional feature named in
+          # the first failure; core codecs are never removed.
+          configured=false
+          for attempt in $(seq 1 20); do
+            flags=("${base[@]}" "${core[@]}" "${optional[@]}")
+            printf '%s\n' "${flags[@]}" > ../dist/configure-options.txt
+            if ../configure "${flags[@]}" > "../dist/configure-attempt-${attempt}.txt" 2>&1; then
+              configured=true
+              break
+            fi
+            error=$(grep -E '^ERROR:|^Unknown option' "../dist/configure-attempt-${attempt}.txt" | tail -1 || true)
+            [[ -n "$error" ]] || { cat "../dist/configure-attempt-${attempt}.txt"; exit 1; }
+            echo "$error" >&2
+            normalized=${error,,}
+            normalized=${normalized//-/_}
+            drop=
+            for option in "${optional[@]}"; do
+              name=${option#--enable-}
+              name=${name//-/_}
+              alias=${name#lib}
+              if [[ "$normalized" == *"$name"* ]] \
+                 || [[ ${#alias} -ge 5 && "$normalized" == *"$alias"* ]]; then
+                drop=$option
+                break
+              fi
+            done
+            [[ -n "$drop" ]] || { cat "../dist/configure-attempt-${attempt}.txt"; exit 1; }
+            echo "$drop: $error" >> ../dist/skipped-options.txt
+            next=()
+            for option in "${optional[@]}"; do
+              [[ "$option" == "$drop" ]] || next+=("$option")
+            done
+            optional=("${next[@]}")
+          done
+          [[ "$configured" == true ]] || { echo 'Configuration retries exhausted' >&2; exit 1; }
+          cp ffbuild/config.log ../dist/config.log
+          cat ../dist/configure-attempt-*.txt >> ../dist/configure-history.txt
 
-      - name: Upload FFmpeg artifacts
-        uses: actions/upload-artifact@v4
+      - name: Compile and verify
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          cd build
+          make -j2 > ../dist/build.log 2>&1 || {
+            tail -100 ../dist/build.log
+            exit 1
+          }
+          cp ffmpeg.exe ffprobe.exe ffplay.exe ../dist/
+          cd ..
+          # External libraries are often DLL-backed even for a static FFmpeg
+          # build. Bundle the target architecture's MinGW runtime DLLs.
+          cp "$MINGW_PREFIX"/bin/*.dll dist/
+          dist/ffmpeg.exe -hide_banner -version > dist/version.txt
+          dist/ffmpeg.exe -hide_banner -buildconf > dist/buildconf.txt
+          dist/ffmpeg.exe -hide_banner -encoders > dist/encoders.txt
+          dist/ffmpeg.exe -hide_banner -decoders > dist/decoders.txt
+          dist/ffmpeg.exe -hide_banner -filters > dist/filters.txt
+          dist/ffprobe.exe -version > /dev/null
+          dist/ffplay.exe -version > /dev/null
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            required=(libx264 libx265 libvpx-vp9 libaom-av1 libopus libfdk_aac aac)
+          else
+            required=(libx264 libopus aac)
+          fi
+          for name in "${required[@]}"; do
+            awk -v name="$name" '$2 == name { found=1 } END { exit !found }' dist/encoders.txt || {
+              echo "Required encoder missing: $name" >&2
+              exit 1
+            }
+          done
+          awk '$2 == "aac" { found=1 } END { exit !found }' dist/decoders.txt || {
+            echo 'Required AAC decoder missing' >&2
+            exit 1
+          }
+          # Exercise both the native AAC path and the external FDK encoder
+          # where it is mandatory. Listing an encoder alone is not sufficient.
+          for encoder in aac; do
+            dist/ffmpeg.exe -hide_banner -loglevel error -f lavfi \
+              -i 'sine=frequency=1000:duration=0.25' -c:a "$encoder" \
+              -y "dist/smoke-${encoder}.m4a"
+            dist/ffmpeg.exe -hide_banner -loglevel error \
+              -i "dist/smoke-${encoder}.m4a" -f null -
+            rm "dist/smoke-${encoder}.m4a"
+          done
+          if [[ "$BUILD_ARCH" == x64 ]]; then
+            dist/ffmpeg.exe -hide_banner -loglevel error -f lavfi \
+              -i 'sine=frequency=1000:duration=0.25' -c:a libfdk_aac \
+              -y dist/smoke-fdk.m4a
+            dist/ffmpeg.exe -hide_banner -loglevel error \
+              -i dist/smoke-fdk.m4a -f null -
+            rm dist/smoke-fdk.m4a
+          fi
+          {
+            echo 'Verified encoders:'
+            printf '  %s\n' "${required[@]}"
+            echo 'Verified decoders: aac'
+            echo 'AAC audio encode and decode smoke tests: passed'
+            echo 'The complete enabled lists are encoders.txt and decoders.txt.'
+            echo 'Unavailable packages and skipped options are listed separately.'
+          } > dist/verification.txt
+          {
+            printf 'architecture: %s\n' "$BUILD_ARCH"
+            for name in aac libfdk_aac libx264 libx265 libvpx-vp9 libaom-av1 libopus; do
+              if awk -v name="$name" '$2 == name { found=1 } END { exit !found }' dist/encoders.txt; then
+                printf '%s: enabled\n' "$name"
+              else
+                printf '%s: unavailable\n' "$name"
+              fi
+            done
+          } > dist/codec-audit.txt
+          cp LICENSE.md dist/ 2>/dev/null || true
+          cp COPYING.GPLv3 dist/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v6
         with:
-          name: ffmpeg-${{ matrix.name }}
-          path: dist/${{ matrix.name }}
+          name: ffmpeg-windows-${{ matrix.arch }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ffmpeg-failure-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            dist/
+            build/ffbuild/config.log
+          if-no-files-found: ignore
